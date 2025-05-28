@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 	_ "modernc.org/sqlite"
 )
@@ -49,11 +50,24 @@ func main() {
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );`)
 
+	// Create the sessions table
+	createTable(db, "sessions", `(
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    room TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL
+);`)
+
 	// Initialize authentication service
 	authService, err := NewAuthService()
 	if err != nil {
 		log.Fatalf("Failed to initialize authentication service: %v", err)
 	}
+
+	// Initialize session service
+	sessionService := NewSessionService(db)
 
 	// Create hub and start it
 	hub := NewHub(db)
@@ -61,12 +75,54 @@ func main() {
 
 	// Setup router
 	r := chi.NewRouter()
+
+	// CORS middleware configuration
+	corsMiddleware := cors.New(cors.Options{
+		// Only allow requests from your frontend
+		AllowedOrigins: []string{
+			"http://localhost:5173", // Vite dev server
+			"http://127.0.0.1:5173", // Vite dev server alternative
+			"http://localhost:3000", // Alternative dev port
+			"http://127.0.0.1:3000", // Alternative dev port
+		},
+		// Allow these HTTP methods
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		// Allow these headers
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+		},
+		// Allow credentials (cookies, authorization headers, etc)
+		AllowCredentials: true,
+		// Cache preflight requests for 5 minutes
+		MaxAge: 300,
+	})
+
+	// Apply middleware
+	r.Use(corsMiddleware.Handler)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	// Authentication endpoint
+	r.Post("/auth", func(w http.ResponseWriter, r *http.Request) {
+		HandleAuth(authService, sessionService, w, r)
+	})
+
+	// Session validation endpoint
+	r.Get("/session", func(w http.ResponseWriter, r *http.Request) {
+		HandleSessionCheck(sessionService, w, r)
+	})
+
+	// Logout endpoint
+	r.Post("/logout", func(w http.ResponseWriter, r *http.Request) {
+		HandleLogout(sessionService, w, r)
+	})
+
 	// WebSocket endpoint
 	r.Get("/ws", func(w http.ResponseWriter, r *http.Request) {
-		ServeWs(hub, authService, w, r)
+		ServeWs(hub, authService, sessionService, w, r)
 	})
 
 	// Health check endpoint
@@ -84,6 +140,9 @@ func main() {
 	addr := ":" + port
 
 	log.Printf("Server starting on %s", addr)
+	log.Println("Authentication endpoint: POST /auth")
+	log.Println("Session check endpoint: GET /session")
+	log.Println("Logout endpoint: POST /logout")
 	log.Println("WebSocket endpoint: /ws")
 	log.Println("Health check endpoint: /health")
 

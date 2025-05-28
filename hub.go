@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,11 +17,13 @@ import (
 )
 
 const (
-	DefaultRoom    = "DEFAULT_ROOM"
-	WriteWait      = 10 * time.Second
-	PongWait       = 60 * time.Second
-	PingPeriod     = (PongWait * 9) / 10
-	MaxMessageSize = 512
+	DefaultRoom       = "DEFAULT_ROOM"
+	WriteWait         = 10 * time.Second
+	PongWait          = 60 * time.Second
+	PingPeriod        = (PongWait * 9) / 10
+	MaxMessageSize    = 512
+	SessionDuration   = 1 * time.Hour // Changed from 7 days to 1 hour
+	SessionCookieName = "chat_session"
 )
 
 // MessageType represents the different types of messages
@@ -60,6 +65,369 @@ type Hub struct {
 	unregister chan *Client
 	mu         sync.RWMutex
 	db         *sql.DB
+}
+
+// Session represents a user session
+type Session struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	Room         string    `json:"room"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastAccessed time.Time `json:"last_accessed"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+// SessionService manages user sessions
+type SessionService struct {
+	db *sql.DB
+	mu sync.RWMutex
+}
+
+// AuthRequest represents the authentication request
+type AuthRequest struct {
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Room     string `json:"room,omitempty"`
+}
+
+// AuthResponse represents the authentication response
+type AuthResponse struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+	Username string `json:"username,omitempty"`
+	Room     string `json:"room,omitempty"`
+}
+
+// SessionResponse represents the session check response
+type SessionResponse struct {
+	Valid    bool   `json:"valid"`
+	Username string `json:"username,omitempty"`
+	Room     string `json:"room,omitempty"`
+}
+
+// NewSessionService creates a new session service
+func NewSessionService(database *sql.DB) *SessionService {
+	service := &SessionService{
+		db: database,
+	}
+
+	// Clean up expired sessions on startup
+	go service.cleanupExpiredSessions()
+
+	return service
+}
+
+// CreateSession creates a new session
+func (s *SessionService) CreateSession(username, room string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(SessionDuration)
+
+	session := &Session{
+		ID:           sessionID,
+		Username:     username,
+		Room:         room,
+		CreatedAt:    now,
+		LastAccessed: now,
+		ExpiresAt:    expiresAt,
+	}
+
+	query := `INSERT INTO sessions (id, username, room, created_at, last_accessed, expires_at) 
+			  VALUES (?, ?, ?, ?, ?, ?)`
+
+	_, err = s.db.Exec(query, session.ID, session.Username, session.Room,
+		session.CreatedAt.Format(time.RFC3339),
+		session.LastAccessed.Format(time.RFC3339),
+		session.ExpiresAt.Format(time.RFC3339))
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to save session: %w", err)
+	}
+
+	log.Printf("Created session for user %s in room %s (expires: %s)",
+		username, room, expiresAt.Format(time.RFC3339))
+
+	return session, nil
+}
+
+// GetSession retrieves a session by ID
+func (s *SessionService) GetSession(sessionID string) (*Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, username, room, created_at, last_accessed, expires_at 
+			  FROM sessions WHERE id = ? AND expires_at > datetime('now')`
+
+	row := s.db.QueryRow(query, sessionID)
+
+	var session Session
+	var createdAtStr, lastAccessedStr, expiresAtStr string
+
+	err := row.Scan(&session.ID, &session.Username, &session.Room,
+		&createdAtStr, &lastAccessedStr, &expiresAtStr)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("session not found or expired")
+		}
+		return nil, fmt.Errorf("failed to retrieve session: %w", err)
+	}
+
+	// Parse timestamps
+	if session.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr); err != nil {
+		return nil, fmt.Errorf("failed to parse created_at: %w", err)
+	}
+	if session.LastAccessed, err = time.Parse(time.RFC3339, lastAccessedStr); err != nil {
+		return nil, fmt.Errorf("failed to parse last_accessed: %w", err)
+	}
+	if session.ExpiresAt, err = time.Parse(time.RFC3339, expiresAtStr); err != nil {
+		return nil, fmt.Errorf("failed to parse expires_at: %w", err)
+	}
+
+	return &session, nil
+}
+
+// UpdateSessionAccess updates the last accessed time for a session
+func (s *SessionService) UpdateSessionAccess(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	expiresAt := now.Add(SessionDuration)
+
+	query := `UPDATE sessions 
+			  SET last_accessed = ?, expires_at = ? 
+			  WHERE id = ? AND expires_at > datetime('now')`
+
+	result, err := s.db.Exec(query,
+		now.Format(time.RFC3339),
+		expiresAt.Format(time.RFC3339),
+		sessionID)
+
+	if err != nil {
+		return fmt.Errorf("failed to update session access: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("session not found or expired")
+	}
+
+	return nil
+}
+
+// DeleteSession removes a session
+func (s *SessionService) DeleteSession(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `DELETE FROM sessions WHERE id = ?`
+	_, err := s.db.Exec(query, sessionID)
+
+	if err == nil {
+		log.Printf("Deleted session: %s", sessionID)
+	}
+
+	return err
+}
+
+// cleanupExpiredSessions periodically cleans up expired sessions
+func (s *SessionService) cleanupExpiredSessions() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		query := `DELETE FROM sessions WHERE expires_at <= datetime('now')`
+		result, err := s.db.Exec(query)
+		if err != nil {
+			log.Printf("Error cleaning up expired sessions: %v", err)
+		} else {
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected > 0 {
+				log.Printf("Cleaned up %d expired sessions", rowsAffected)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// generateSessionID generates a secure random session ID
+func generateSessionID() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// HandleAuth handles authentication and session creation
+func HandleAuth(authService *AuthService, sessionService *SessionService, w http.ResponseWriter, r *http.Request) {
+	var authReq AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&authReq); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate token
+	if !authService.IsValidToken(authReq.Token) {
+		log.Printf("Invalid token attempt for user %s", authReq.Username)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AuthResponse{
+			Success: false,
+			Message: "Invalid authentication token",
+		})
+		return
+	}
+
+	// Validate username
+	if authReq.Username == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(AuthResponse{
+			Success: false,
+			Message: "Username is required",
+		})
+		return
+	}
+
+	// Set default room if not provided
+	if authReq.Room == "" {
+		authReq.Room = DefaultRoom
+	}
+
+	// Create session
+	session, err := sessionService.CreateSession(authReq.Username, authReq.Room)
+	if err != nil {
+		log.Printf("Failed to create session for %s: %v", authReq.Username, err)
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	// Set CORS headers first
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+
+	// Get domain from host
+	domain := r.Host
+	if idx := strings.Index(domain, ":"); idx != -1 {
+		domain = domain[:idx]
+	}
+
+	// Log cookie settings for debugging
+	log.Printf("Setting cookie with domain: %s, secure: %v, samesite: %v",
+		domain, true, http.SameSiteNoneMode)
+
+	cookie := &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    session.ID,
+		Path:     "/",
+		Domain:   domain,
+		HttpOnly: true,
+		Secure:   true,                  // Required for SameSite=None
+		SameSite: http.SameSiteNoneMode, // Allow cross-origin requests
+		Expires:  session.ExpiresAt,
+		MaxAge:   int(SessionDuration.Seconds()),
+	}
+	http.SetCookie(w, cookie)
+
+	// Log response headers for debugging
+	log.Printf("Response headers after setting cookie: %v", w.Header())
+
+	// Send response
+	json.NewEncoder(w).Encode(AuthResponse{
+		Success:  true,
+		Username: session.Username,
+		Room:     session.Room,
+	})
+
+	log.Printf("User %s authenticated successfully for room %s", authReq.Username, authReq.Room)
+}
+
+// HandleSessionCheck validates an existing session
+func HandleSessionCheck(sessionService *SessionService, w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+
+	cookie, err := r.Cookie(SessionCookieName)
+	fmt.Println("Cookie:", cookie)
+	if err != nil {
+		json.NewEncoder(w).Encode(SessionResponse{Valid: false})
+		return
+	}
+
+	session, err := sessionService.GetSession(cookie.Value)
+	if err != nil {
+		json.NewEncoder(w).Encode(SessionResponse{Valid: false})
+		return
+	}
+
+	// Update last accessed time
+	sessionService.UpdateSessionAccess(session.ID)
+
+	json.NewEncoder(w).Encode(SessionResponse{
+		Valid:    true,
+		Username: session.Username,
+		Room:     session.Room,
+	})
+}
+
+// HandleLogout handles user logout
+func HandleLogout(sessionService *SessionService, w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+
+	cookie, err := r.Cookie(SessionCookieName)
+	if err == nil {
+		sessionService.DeleteSession(cookie.Value)
+	}
+
+	// Clear the cookie
+	domain := r.Host
+	if idx := strings.Index(domain, ":"); idx != -1 {
+		domain = domain[:idx]
+	}
+
+	// Set CORS headers first
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+
+	// Clear the session cookie
+	clearCookie := http.Cookie{
+		Name:     SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		Domain:   domain,
+		HttpOnly: true,
+		Secure:   true,                  // Required for SameSite=None
+		SameSite: http.SameSiteNoneMode, // Allow cross-origin requests
+		Expires:  time.Unix(0, 0),
+	}
+	http.SetCookie(w, &clearCookie)
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 // NewHub creates a new Hub instance
@@ -381,8 +749,13 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Configure appropriately for production
+		origin := r.Header.Get("Origin")
+		// Allow all localhost origins during development
+		return strings.HasPrefix(origin, "http://localhost:") ||
+			strings.HasPrefix(origin, "http://127.0.0.1:") ||
+			origin == ""
 	},
+	EnableCompression: true,
 }
 
 // AuthService handles authentication
@@ -400,8 +773,8 @@ func NewAuthService() (*AuthService, error) {
 
 	// Load tokens from environment variable (comma-separated)
 	if envTokens := os.Getenv("CHAT_AUTH_TOKENS"); envTokens != "" {
-		tokens := strings.SplitSeq(envTokens, ",")
-		for token := range tokens {
+		tokens := strings.Split(envTokens, ",")
+		for _, token := range tokens {
 			token = strings.TrimSpace(token)
 			if token != "" {
 				service.allowedTokens[token] = true
@@ -479,48 +852,86 @@ func (a *AuthService) RemoveToken(token string) {
 	delete(a.allowedTokens, token)
 }
 
-// ServeWs handles WebSocket upgrade requests
-func ServeWs(hub *Hub, auth *AuthService, w http.ResponseWriter, r *http.Request) {
-	username := r.URL.Query().Get("username")
-	room := r.URL.Query().Get("room")
+// ServeWs handles WebSocket upgrade requests with session support
+func ServeWs(hub *Hub, auth *AuthService, sessions *SessionService, w http.ResponseWriter, r *http.Request) {
+	// Try to get session from cookie first
+	var username, room string
+	var existingSession *Session
+
+	// Log all cookies for debugging
+	log.Printf("All cookies in request: %v", r.Cookies())
+
+	cookie, err := r.Cookie(SessionCookieName)
+	if err != nil {
+		log.Printf("Cookie error: %v", err)
+	} else {
+		log.Printf("Found session cookie: %v", cookie)
+		// Validate session
+		session, err := sessions.GetSession(cookie.Value)
+		if err != nil {
+			log.Printf("Session validation error: %v", err)
+		} else {
+			username = session.Username
+			room = session.Room
+			existingSession = session
+			// Update session access time
+			sessions.UpdateSessionAccess(session.ID)
+			log.Printf("WebSocket connection using session for user %s in room %s", username, room)
+		}
+	}
+
+	// If no valid session, fall back to query parameters and token validation
+	if username == "" {
+		username = r.URL.Query().Get("username")
+		room = r.URL.Query().Get("room")
+
+		// Extract token from subprotocols
+		var token string
+		for _, subprotocol := range websocket.Subprotocols(r) {
+			token = subprotocol
+			break
+		}
+
+		// Validate input
+		if username == "" {
+			log.Printf("Username missing in WebSocket request")
+			http.Error(w, "Username is required", http.StatusBadRequest)
+			return
+		}
+
+		if token == "" {
+			log.Printf("Token missing in WebSocket request")
+			http.Error(w, "Authentication token required", http.StatusUnauthorized)
+			return
+		}
+
+		if !auth.IsValidToken(token) {
+			log.Printf("Invalid token attempt for user %s (token length: %d), token: %s", username, len(token), token)
+			http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
+			return
+		}
+
+		// Set up subprotocols for upgrade
+		upgrader.Subprotocols = []string{token}
+	}
 
 	if room == "" {
 		room = DefaultRoom
 	}
 
-	// Extract token from subprotocols
-	var token string
-	for _, subprotocol := range websocket.Subprotocols(r) {
-		token = subprotocol
-		break
-	}
-
-	// Validate input
-	if username == "" {
-		http.Error(w, "Username is required", http.StatusBadRequest)
-		return
-	}
-
-	if token == "" {
-		http.Error(w, "Authentication token required", http.StatusUnauthorized)
-		return
-	}
-
-	if !auth.IsValidToken(token) {
-		log.Printf("Invalid token attempt for user %s (token length: %d)", username, len(token))
-		http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
-		return
-	}
-
-	// Check for duplicate username in room
+	// Check for duplicate username in room, but allow same user to reconnect
 	if hub.isUsernameInRoom(username, room) {
-		log.Printf("Username '%s' already exists in room '%s'", username, room)
-		http.Error(w, "Username already exists in this room", http.StatusBadRequest)
-		return
+		// Allow reconnection if this is the same user
+		if existingSession != nil && existingSession.Username == username && existingSession.Room == room {
+			log.Printf("User %s reconnecting to room %s", username, room)
+		} else {
+			log.Printf("Username '%s' already exists in room '%s'", username, room)
+			http.Error(w, "Username already exists in this room", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Upgrade connection
-	upgrader.Subprotocols = []string{token}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade connection for %s: %v", username, err)
