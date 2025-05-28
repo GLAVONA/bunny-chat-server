@@ -78,12 +78,13 @@ func main() {
 
 	// CORS middleware configuration
 	corsMiddleware := cors.New(cors.Options{
-		// Only allow requests from your frontend
+		// Allow requests from both development and production origins
 		AllowedOrigins: []string{
 			"http://localhost:5173", // Vite dev server
 			"http://127.0.0.1:5173", // Vite dev server alternative
 			"http://localhost:3000", // Alternative dev port
 			"http://127.0.0.1:3000", // Alternative dev port
+			"https://lulunajiji.me",
 		},
 		// Allow these HTTP methods
 		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -93,11 +94,18 @@ func main() {
 			"Authorization",
 			"Content-Type",
 			"X-CSRF-Token",
+			"Origin",
+			"X-Requested-With",
 		},
 		// Allow credentials (cookies, authorization headers, etc)
 		AllowCredentials: true,
 		// Cache preflight requests for 5 minutes
 		MaxAge: 300,
+		// Expose headers to the client
+		ExposedHeaders: []string{
+			"Set-Cookie",
+			"Access-Control-Allow-Credentials",
+		},
 	})
 
 	// Apply middleware
