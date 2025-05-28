@@ -750,9 +750,10 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
-		// Allow all localhost origins during development
+		// Allow both development and production origins
 		return strings.HasPrefix(origin, "http://localhost:") ||
 			strings.HasPrefix(origin, "http://127.0.0.1:") ||
+			strings.HasPrefix(origin, "https://lulunajiji.me") ||
 			origin == ""
 	},
 	EnableCompression: true,
