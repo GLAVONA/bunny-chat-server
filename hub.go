@@ -56,11 +56,13 @@ type Message struct {
 
 // Client represents a connected WebSocket client
 type Client struct {
-	conn     *websocket.Conn
-	send     chan Message
-	hub      *Hub
-	username string
-	room     string
+	conn           *websocket.Conn
+	send           chan Message
+	hub            *Hub
+	username       string
+	room           string
+	sessionID      string
+	sessionService *SessionService
 }
 
 // Hub manages all client connections and message broadcasting
@@ -202,6 +204,7 @@ func (s *SessionService) GetSession(sessionID string) (*Session, error) {
 
 // UpdateSessionAccess updates the last accessed time for a session
 func (s *SessionService) UpdateSessionAccess(sessionID string) error {
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -724,6 +727,13 @@ func (c *Client) readPump() {
 		msg.Username = c.username
 		msg.Room = c.room
 
+		// Update session access time
+		if c.sessionID != "" {
+			if err := c.sessionService.UpdateSessionAccess(c.sessionID); err != nil {
+				log.Printf("Failed to update session access for %s: %v", c.username, err)
+			}
+		}
+
 		switch msg.Type {
 		case LoadMoreHistory:
 			// Handle pagination request
@@ -926,107 +936,46 @@ func (a *AuthService) RemoveToken(token string) {
 
 // ServeWs handles WebSocket upgrade requests with session support
 func ServeWs(hub *Hub, auth *AuthService, sessions *SessionService, w http.ResponseWriter, r *http.Request) {
-	// Try to get session from cookie first
-	var username, room string
-	var existingSession *Session
-
-	// Log all cookies for debugging
-	log.Printf("All cookies in request: %v", r.Cookies())
-
+	// Get session cookie
 	cookie, err := r.Cookie(SessionCookieName)
 	if err != nil {
-		log.Printf("Cookie error: %v", err)
-	} else {
-		log.Printf("Found session cookie: %v", cookie)
-		// Validate session
-		session, err := sessions.GetSession(cookie.Value)
-		if err != nil {
-			log.Printf("Session validation error: %v", err)
-		} else {
-			username = session.Username
-			room = session.Room
-			existingSession = session
-			// Update session access time
-			sessions.UpdateSessionAccess(session.ID)
-			log.Printf("WebSocket connection using session for user %s in room %s", username, room)
-		}
-	}
-
-	// If no valid session, fall back to query parameters and token validation
-	if username == "" {
-		username = r.URL.Query().Get("username")
-		room = r.URL.Query().Get("room")
-
-		// Extract token from subprotocols
-		var token string
-		for _, subprotocol := range websocket.Subprotocols(r) {
-			token = subprotocol
-			break
-		}
-
-		// Validate input
-		if username == "" {
-			log.Printf("Username missing in WebSocket request")
-			http.Error(w, "Username is required", http.StatusBadRequest)
-			return
-		}
-
-		if token == "" {
-			log.Printf("Token missing in WebSocket request")
-			http.Error(w, "Authentication token required", http.StatusUnauthorized)
-			return
-		}
-
-		if !auth.IsValidToken(token) {
-			log.Printf("Invalid token attempt for user %s (token length: %d), token: %s", username, len(token), token)
-			http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
-			return
-		}
-
-		// Set up subprotocols for upgrade
-		upgrader.Subprotocols = []string{token}
-	}
-
-	if room == "" {
-		room = DefaultRoom
-	}
-
-	// Check for duplicate username in room, but allow same user to reconnect
-	if hub.isUsernameInRoom(username, room) {
-		// Allow reconnection if this is the same user
-		if existingSession != nil && existingSession.Username == username && existingSession.Room == room {
-			log.Printf("User %s reconnecting to room %s", username, room)
-		} else {
-			log.Printf("Username '%s' already exists in room '%s'", username, room)
-			http.Error(w, "Username already exists in this room", http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Upgrade connection
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade connection for %s: %v", username, err)
+		log.Printf("No session cookie found: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	log.Printf("Client connected: %s, Room: %s, RemoteAddr: %s",
-		username, room, conn.RemoteAddr())
+	// Validate session
+	session, err := sessions.GetSession(cookie.Value)
+	if err != nil {
+		log.Printf("Invalid session: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade connection: %v", err)
+		return
+	}
 
 	// Create and register client
 	client := &Client{
-		conn:     conn,
-		send:     make(chan Message, 256),
-		hub:      hub,
-		username: username,
-		room:     room,
+		conn:           conn,
+		send:           make(chan Message, 256),
+		hub:            hub,
+		username:       session.Username,
+		room:           session.Room,
+		sessionID:      session.ID,
+		sessionService: sessions,
 	}
 
-	client.hub.register <- client
+	// Register client
+	hub.register <- client
 
-	// Start client goroutines
-	go client.writePump()
+	// Start goroutines for reading and writing
 	go client.readPump()
+	go client.writePump()
 }
 
 // isUsernameInRoom checks if a username already exists in a room
