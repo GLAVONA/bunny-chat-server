@@ -24,17 +24,19 @@ const (
 	MaxMessageSize    = 512
 	SessionDuration   = 1 * time.Hour // Changed from 7 days to 1 hour
 	SessionCookieName = "chat_session"
+	DefaultPageSize   = 50 // Default number of messages per page
 )
 
 // MessageType represents the different types of messages
 type MessageType string
 
 const (
-	ChatMessage  MessageType = "chat"
-	JoinMessage  MessageType = "join"
-	LeaveMessage MessageType = "leave"
-	HistoryBatch MessageType = "history_batch"
-	ErrorMessage MessageType = "error"
+	ChatMessage     MessageType = "chat"
+	JoinMessage     MessageType = "join"
+	LeaveMessage    MessageType = "leave"
+	HistoryBatch    MessageType = "history_batch"
+	ErrorMessage    MessageType = "error"
+	LoadMoreHistory MessageType = "load_more_history"
 )
 
 // Message represents a message in the chat system
@@ -46,6 +48,10 @@ type Message struct {
 	UserList  []string    `json:"userList,omitempty"`
 	Timestamp string      `json:"timestamp,omitempty"`
 	History   []Message   `json:"history,omitempty"`
+	// Pagination fields
+	PageSize  int    `json:"pageSize,omitempty"`
+	PageToken string `json:"pageToken,omitempty"`
+	HasMore   bool   `json:"hasMore,omitempty"`
 }
 
 // Client represents a connected WebSocket client
@@ -549,34 +555,27 @@ func (h *Hub) getUserListForRoom(room string) []string {
 	return userList
 }
 
-// sendHistoricalMessages sends chat history to a newly connected client
+// sendHistoricalMessages sends historical messages to a client
 func (h *Hub) sendHistoricalMessages(client *Client) {
-	messages, err := h.getHistoricalMessages(client.room)
+	messages, lastTimestamp, err := h.getHistoricalMessages(client.room, DefaultPageSize, "")
 	if err != nil {
-		log.Printf("Error fetching history for %s in room %s: %v",
-			client.username, client.room, err)
-		return
-	}
-
-	if len(messages) == 0 {
-		log.Printf("No historical messages for %s in room %s",
-			client.username, client.room)
+		log.Printf("Error getting historical messages for %s: %v", client.username, err)
 		return
 	}
 
 	historyMsg := Message{
-		Type:    HistoryBatch,
-		Room:    client.room,
-		History: messages,
+		Type:      HistoryBatch,
+		Room:      client.room,
+		History:   messages,
+		PageToken: lastTimestamp,
+		HasMore:   len(messages) == DefaultPageSize,
 	}
 
 	select {
 	case client.send <- historyMsg:
-		log.Printf("Sent %d historical messages to %s in room %s",
-			len(messages), client.username, client.room)
+		log.Printf("Sent %d historical messages to %s", len(messages), client.username)
 	default:
-		log.Printf("Failed to send history to %s: channel full", client.username)
-		h.unregister <- client
+		log.Printf("Failed to send historical messages to %s: channel full", client.username)
 	}
 }
 
@@ -608,24 +607,45 @@ func (h *Hub) broadcastToRoom(message Message) {
 	}
 }
 
-// getHistoricalMessages fetches chat history for a room from database
-func (h *Hub) getHistoricalMessages(room string) ([]Message, error) {
+// getHistoricalMessages fetches chat history for a room from database with pagination
+func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string) ([]Message, string, error) {
 	if h.db == nil {
-		return nil, fmt.Errorf("database not available")
+		return nil, "", fmt.Errorf("database not available")
 	}
 
-	query := `SELECT type, username, content, room, timestamp 
-			  FROM messages 
-			  WHERE room = ? 
-			  ORDER BY timestamp ASC`
+	if pageSize <= 0 {
+		pageSize = DefaultPageSize
+	}
 
-	rows, err := h.db.Query(query, room)
+	// Parse the page token (timestamp) if provided
+	var whereClause string
+	var args []interface{}
+	if pageToken != "" {
+		whereClause = "WHERE room = ? AND timestamp < ?"
+		args = []interface{}{room, pageToken}
+	} else {
+		whereClause = "WHERE room = ?"
+		args = []interface{}{room}
+	}
+
+	query := fmt.Sprintf(`SELECT type, username, content, room, timestamp 
+			  FROM messages 
+			  %s
+			  ORDER BY timestamp DESC
+			  LIMIT ?`, whereClause)
+
+	// Add pageSize to args
+	args = append(args, pageSize+1) // Fetch one extra to check if there are more messages
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query failed: %w", err)
+		return nil, "", fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var messages []Message
+	var lastTimestamp string
+
 	for rows.Next() {
 		var msg Message
 		var timestampStr string
@@ -639,9 +659,26 @@ func (h *Hub) getHistoricalMessages(room string) ([]Message, error) {
 		msg.Type = ChatMessage // Ensure history items are chat type
 		msg.Timestamp = timestampStr
 		messages = append(messages, msg)
+		lastTimestamp = timestampStr
 	}
 
-	return messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	// Check if we have more messages
+	hasMore := len(messages) > pageSize
+	if hasMore {
+		// Remove the extra message we fetched
+		messages = messages[:pageSize]
+	}
+
+	// Reverse the messages to get them in chronological order
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+
+	return messages, lastTimestamp, nil
 }
 
 // saveMessage saves a chat message to the database
@@ -686,16 +723,49 @@ func (c *Client) readPump() {
 		// Set message metadata
 		msg.Username = c.username
 		msg.Room = c.room
-		msg.Type = ChatMessage
-		msg.Timestamp = time.Now().Format(time.RFC3339)
 
-		// Save to database
-		if err := c.hub.saveMessage(msg); err != nil {
-			log.Printf("Error saving message from %s: %v", c.username, err)
+		switch msg.Type {
+		case LoadMoreHistory:
+			// Handle pagination request
+			pageSize := msg.PageSize
+			if pageSize <= 0 {
+				pageSize = DefaultPageSize
+			}
+
+			messages, lastTimestamp, err := c.hub.getHistoricalMessages(c.room, pageSize, msg.PageToken)
+			if err != nil {
+				log.Printf("Error getting more history for %s: %v", c.username, err)
+				continue
+			}
+
+			historyMsg := Message{
+				Type:      HistoryBatch,
+				Room:      c.room,
+				History:   messages,
+				PageToken: lastTimestamp,
+				HasMore:   len(messages) == pageSize,
+			}
+
+			select {
+			case c.send <- historyMsg:
+				log.Printf("Sent %d more historical messages to %s", len(messages), c.username)
+			default:
+				log.Printf("Failed to send more history to %s: channel full", c.username)
+			}
+
+		case ChatMessage:
+			// Handle regular chat message
+			msg.Type = ChatMessage
+			msg.Timestamp = time.Now().Format(time.RFC3339)
+
+			// Save to database
+			if err := c.hub.saveMessage(msg); err != nil {
+				log.Printf("Error saving message from %s: %v", c.username, err)
+			}
+
+			// Broadcast to room
+			c.hub.broadcast <- msg
 		}
-
-		// Broadcast to room
-		c.hub.broadcast <- msg
 	}
 }
 
