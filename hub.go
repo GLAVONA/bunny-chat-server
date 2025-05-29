@@ -687,6 +687,7 @@ func (c *Client) readPump() {
 		msg.Username = c.username
 		msg.Room = c.room
 		msg.Type = ChatMessage
+		msg.Timestamp = time.Now().Format(time.RFC3339)
 
 		// Save to database
 		if err := c.hub.saveMessage(msg); err != nil {
