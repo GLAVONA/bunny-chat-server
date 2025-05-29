@@ -21,8 +21,8 @@ const (
 	WriteWait         = 10 * time.Second
 	PongWait          = 60 * time.Second
 	PingPeriod        = (PongWait * 9) / 10
-	MaxMessageSize    = 512
-	SessionDuration   = 1 * time.Hour // Changed from 7 days to 1 hour
+	MaxMessageSize    = 10 * 1024 * 1024 // Increased to 10MB to handle images
+	SessionDuration   = 1 * time.Hour    // Changed from 7 days to 1 hour
 	SessionCookieName = "chat_session"
 	DefaultPageSize   = 50 // Default number of messages per page
 )
@@ -37,6 +37,7 @@ const (
 	HistoryBatch    MessageType = "history_batch"
 	ErrorMessage    MessageType = "error"
 	LoadMoreHistory MessageType = "load_more_history"
+	ImageMessage    MessageType = "image" // New message type for images
 )
 
 // Message represents a message in the chat system
@@ -48,6 +49,9 @@ type Message struct {
 	UserList  []string    `json:"userList,omitempty"`
 	Timestamp string      `json:"timestamp,omitempty"`
 	History   []Message   `json:"history,omitempty"`
+	// Image fields
+	ImageData string `json:"imageData,omitempty"` // Base64 encoded image data
+	ImageType string `json:"imageType,omitempty"` // MIME type of the image
 	// Pagination fields
 	PageSize  int    `json:"pageSize,omitempty"`
 	PageToken string `json:"pageToken,omitempty"`
@@ -631,7 +635,7 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 		args = []interface{}{room}
 	}
 
-	query := fmt.Sprintf(`SELECT type, username, content, room, timestamp 
+	query := fmt.Sprintf(`SELECT type, username, content, room, timestamp, image_data, image_type 
 			  FROM messages 
 			  %s
 			  ORDER BY timestamp DESC
@@ -651,15 +655,23 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 
 	for rows.Next() {
 		var msg Message
+		var msgType string
 		var timestampStr string
-
-		err := rows.Scan(&msg.Type, &msg.Username, &msg.Content, &msg.Room, &timestampStr)
+		var imageData sql.NullString
+		var imageType sql.NullString
+		err := rows.Scan(&msgType, &msg.Username, &msg.Content, &msg.Room, &timestampStr, &imageData, &imageType)
 		if err != nil {
 			log.Printf("Error scanning message row: %v", err)
 			continue
 		}
 
-		msg.Type = ChatMessage // Ensure history items are chat type
+		msg.Type = MessageType(msgType)
+		if imageData.Valid {
+			msg.ImageData = imageData.String
+		}
+		if imageType.Valid {
+			msg.ImageType = imageType.String
+		}
 		msg.Timestamp = timestampStr
 		messages = append(messages, msg)
 		lastTimestamp = timestampStr
@@ -690,11 +702,11 @@ func (h *Hub) saveMessage(msg Message) error {
 		return fmt.Errorf("database not available")
 	}
 
-	query := `INSERT INTO messages(type, username, content, room, timestamp) 
-			  VALUES(?, ?, ?, ?, ?)`
+	query := `INSERT INTO messages(type, username, content, room, timestamp, image_data, image_type) 
+			  VALUES(?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := h.db.Exec(query, string(msg.Type), msg.Username, msg.Content,
-		msg.Room, time.Now().Format(time.RFC3339))
+		msg.Room, time.Now().Format(time.RFC3339), msg.ImageData, msg.ImageType)
 
 	return err
 }
@@ -763,9 +775,8 @@ func (c *Client) readPump() {
 				log.Printf("Failed to send more history to %s: channel full", c.username)
 			}
 
-		case ChatMessage:
-			// Handle regular chat message
-			msg.Type = ChatMessage
+		case ChatMessage, ImageMessage:
+			// Handle both chat and image messages
 			msg.Timestamp = time.Now().Format(time.RFC3339)
 
 			// Save to database
@@ -827,8 +838,8 @@ func (c *Client) logMessageSent(message Message) {
 
 // WebSocket upgrader configuration
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	ReadBufferSize:  1024 * 1024, // Increased to 1MB
+	WriteBufferSize: 1024 * 1024, // Increased to 1MB
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		// Allow both development and production origins

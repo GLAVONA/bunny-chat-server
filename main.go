@@ -50,6 +50,9 @@ func main() {
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );`)
 
+	// Add image columns if they don't exist
+	addImageColumns(db)
+
 	// Create the sessions table
 	createTable(db, "sessions", `(
     id TEXT PRIMARY KEY,
@@ -237,4 +240,27 @@ func printStartupInfo() {
 		log.Printf("Environment: %s", os.Getenv("GO_ENV"))
 	}
 	log.Println("=================================")
+}
+
+// addImageColumns adds image-related columns to the messages table if they don't exist
+func addImageColumns(db *sql.DB) {
+	// Check if image_data column exists
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='image_data'").Scan(&count)
+	if err != nil {
+		log.Printf("Error checking for image_data column: %v", err)
+		return
+	}
+
+	// Add columns if they don't exist
+	if count == 0 {
+		alterSQL := `ALTER TABLE messages ADD COLUMN image_data TEXT;
+                    ALTER TABLE messages ADD COLUMN image_type TEXT;`
+		_, err := db.Exec(alterSQL)
+		if err != nil {
+			log.Printf("Error adding image columns: %v", err)
+		} else {
+			log.Println("Added image columns to messages table")
+		}
+	}
 }
