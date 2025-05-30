@@ -47,7 +47,26 @@ func main() {
     username TEXT NOT NULL,
     content TEXT,
     room TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    image_data TEXT,
+    image_type TEXT
+);`)
+
+	// Drop and recreate the reactions table
+	_, err = db.Exec("DROP TABLE IF EXISTS reactions")
+	if err != nil {
+		log.Printf("Error dropping reactions table: %v", err)
+	}
+
+	// Create the reactions table
+	createTable(db, "reactions", `(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    reaction TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    UNIQUE(message_id, username, reaction)
 );`)
 
 	// Add image columns if they don't exist

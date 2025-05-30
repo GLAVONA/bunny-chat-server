@@ -17,14 +17,16 @@ import (
 )
 
 const (
-	DefaultRoom       = "DEFAULT_ROOM"
-	WriteWait         = 10 * time.Second
-	PongWait          = 60 * time.Second
-	PingPeriod        = (PongWait * 9) / 10
-	MaxMessageSize    = 10 * 1024 * 1024 // Increased to 10MB to handle images
-	SessionDuration   = 1 * time.Hour    // Changed from 7 days to 1 hour
-	SessionCookieName = "chat_session"
-	DefaultPageSize   = 50 // Default number of messages per page
+	DefaultRoom            = "DEFAULT_ROOM"
+	WriteWait              = 10 * time.Second
+	PongWait               = 60 * time.Second
+	PingPeriod             = (PongWait * 9) / 10
+	MaxMessageSize         = 10 * 1024 * 1024 // Increased to 10MB to handle images
+	SessionDuration        = 1 * time.Hour    // Changed from 7 days to 1 hour
+	SessionCookieName      = "chat_session"
+	DefaultPageSize        = 50              // Default number of messages per page
+	MaxSessionsPerUser     = 3               // Maximum number of active sessions per user
+	SessionCleanupInterval = 1 * time.Minute // Clean up sessions every minute
 )
 
 // MessageType represents the different types of messages
@@ -37,11 +39,13 @@ const (
 	HistoryBatch    MessageType = "history_batch"
 	ErrorMessage    MessageType = "error"
 	LoadMoreHistory MessageType = "load_more_history"
-	ImageMessage    MessageType = "image" // New message type for images
+	ImageMessage    MessageType = "image"    // New message type for images
+	ReactionMessage MessageType = "reaction" // New message type for reactions
 )
 
 // Message represents a message in the chat system
 type Message struct {
+	ID        int         `json:"id,omitempty"`
 	Type      MessageType `json:"type"`
 	Username  string      `json:"username"`
 	Content   string      `json:"content,omitempty"`
@@ -52,6 +56,9 @@ type Message struct {
 	// Image fields
 	ImageData string `json:"imageData,omitempty"` // Base64 encoded image data
 	ImageType string `json:"imageType,omitempty"` // MIME type of the image
+	// Reaction fields
+	ReactionToID int    `json:"reactionToId,omitempty"` // ID of the message being reacted to
+	Reaction     string `json:"reaction,omitempty"`     // The reaction emoji/content
 	// Pagination fields
 	PageSize  int    `json:"pageSize,omitempty"`
 	PageToken string `json:"pageToken,omitempty"`
@@ -134,6 +141,30 @@ func (s *SessionService) CreateSession(username, room string) (*Session, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check number of active sessions for this user
+	var count int
+	query := `SELECT COUNT(*) FROM sessions WHERE username = ? AND expires_at > datetime('now')`
+	err := s.db.QueryRow(query, username).Scan(&count)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check session count: %w", err)
+	}
+
+	if count >= MaxSessionsPerUser {
+		// Delete oldest session for this user
+		query = `
+			DELETE FROM sessions 
+			WHERE id IN (
+				SELECT id FROM sessions 
+				WHERE username = ? 
+				ORDER BY created_at ASC 
+				LIMIT 1
+			)`
+		_, err = s.db.Exec(query, username)
+		if err != nil {
+			return nil, fmt.Errorf("failed to delete old session: %w", err)
+		}
+	}
+
 	sessionID, err := generateSessionID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate session ID: %w", err)
@@ -151,7 +182,7 @@ func (s *SessionService) CreateSession(username, room string) (*Session, error) 
 		ExpiresAt:    expiresAt,
 	}
 
-	query := `INSERT INTO sessions (id, username, room, created_at, last_accessed, expires_at) 
+	query = `INSERT INTO sessions (id, username, room, created_at, last_accessed, expires_at) 
 			  VALUES (?, ?, ?, ?, ?, ?)`
 
 	_, err = s.db.Exec(query, session.ID, session.Username, session.Room,
@@ -257,11 +288,12 @@ func (s *SessionService) DeleteSession(sessionID string) error {
 
 // cleanupExpiredSessions periodically cleans up expired sessions
 func (s *SessionService) cleanupExpiredSessions() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(SessionCleanupInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		s.mu.Lock()
+		// Delete expired sessions
 		query := `DELETE FROM sessions WHERE expires_at <= datetime('now')`
 		result, err := s.db.Exec(query)
 		if err != nil {
@@ -270,6 +302,28 @@ func (s *SessionService) cleanupExpiredSessions() {
 			rowsAffected, _ := result.RowsAffected()
 			if rowsAffected > 0 {
 				log.Printf("Cleaned up %d expired sessions", rowsAffected)
+			}
+		}
+
+		// Delete old sessions for users with too many sessions
+		query = `
+			DELETE FROM sessions 
+			WHERE id IN (
+				SELECT id FROM (
+					SELECT id, username, created_at,
+					ROW_NUMBER() OVER (PARTITION BY username ORDER BY created_at DESC) as rn
+					FROM sessions
+					WHERE expires_at > datetime('now')
+				) 
+				WHERE rn > ?
+			)`
+		result, err = s.db.Exec(query, MaxSessionsPerUser)
+		if err != nil {
+			log.Printf("Error cleaning up excess sessions: %v", err)
+		} else {
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected > 0 {
+				log.Printf("Cleaned up %d excess sessions", rowsAffected)
 			}
 		}
 		s.mu.Unlock()
@@ -546,9 +600,18 @@ func (h *Hub) handleClientUnregistration(client *Client) {
 
 // handleBroadcast processes messages to be broadcast
 func (h *Hub) handleBroadcast(message Message) {
-	log.Printf("Broadcasting message from %s in room %s: %s",
-		message.Username, message.Room, message.Content)
-	h.broadcastToRoom(message)
+	fmt.Printf("broadcasting message: %v", message)
+	switch message.Type {
+	case ChatMessage, ImageMessage:
+		// The message was already saved in readPump, just broadcast it
+		h.broadcastToRoom(message)
+	case ReactionMessage:
+		if err := h.handleReactionMessage(message); err != nil {
+			log.Printf("Error handling reaction: %v", err)
+		}
+	default:
+		h.broadcastToRoom(message)
+	}
 }
 
 // getUserListForRoom returns a list of usernames in a room (caller must hold lock)
@@ -614,39 +677,36 @@ func (h *Hub) broadcastToRoom(message Message) {
 	}
 }
 
-// getHistoricalMessages fetches chat history for a room from database with pagination
+// getHistoricalMessages retrieves historical messages for a room
 func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string) ([]Message, string, error) {
 	if h.db == nil {
 		return nil, "", fmt.Errorf("database not available")
 	}
 
-	if pageSize <= 0 {
-		pageSize = DefaultPageSize
-	}
-
-	// Parse the page token (timestamp) if provided
-	var whereClause string
+	var query string
 	var args []interface{}
-	if pageToken != "" {
-		whereClause = "WHERE room = ? AND timestamp < ?"
-		args = []interface{}{room, pageToken}
+
+	if pageToken == "" {
+		// Initial query
+		query = `SELECT id, type, username, content, timestamp, image_data, image_type 
+				FROM messages 
+				WHERE room = ? 
+				ORDER BY timestamp DESC 
+				LIMIT ?`
+		args = []interface{}{room, pageSize + 1} // +1 to check if there are more messages
 	} else {
-		whereClause = "WHERE room = ?"
-		args = []interface{}{room}
+		// Pagination query
+		query = `SELECT id, type, username, content, timestamp, image_data, image_type 
+				FROM messages 
+				WHERE room = ? AND timestamp < ? 
+				ORDER BY timestamp DESC 
+				LIMIT ?`
+		args = []interface{}{room, pageToken, pageSize + 1}
 	}
-
-	query := fmt.Sprintf(`SELECT type, username, content, room, timestamp, image_data, image_type 
-			  FROM messages 
-			  %s
-			  ORDER BY timestamp DESC
-			  LIMIT ?`, whereClause)
-
-	// Add pageSize to args
-	args = append(args, pageSize+1) // Fetch one extra to check if there are more messages
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		return nil, "", fmt.Errorf("query failed: %w", err)
+		return nil, "", fmt.Errorf("failed to query messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -655,24 +715,33 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 
 	for rows.Next() {
 		var msg Message
-		var msgType string
 		var timestampStr string
-		var imageData sql.NullString
-		var imageType sql.NullString
-		err := rows.Scan(&msgType, &msg.Username, &msg.Content, &msg.Room, &timestampStr, &imageData, &imageType)
+		var imageData, imageType sql.NullString // Use sql.NullString to handle NULL values
+		err := rows.Scan(&msg.ID, &msg.Type, &msg.Username, &msg.Content,
+			&timestampStr, &imageData, &imageType)
 		if err != nil {
-			log.Printf("Error scanning message row: %v", err)
-			continue
+			return nil, "", fmt.Errorf("failed to scan message: %w", err)
 		}
 
-		msg.Type = MessageType(msgType)
+		msg.Room = room
+		msg.Timestamp = timestampStr
+
+		// Handle NULL values for image data
 		if imageData.Valid {
 			msg.ImageData = imageData.String
 		}
 		if imageType.Valid {
 			msg.ImageType = imageType.String
 		}
-		msg.Timestamp = timestampStr
+
+		// Get reactions for this message
+		reactions, err := h.getReactions(msg.ID)
+		if err != nil {
+			log.Printf("Error getting reactions for message %d: %v", msg.ID, err)
+		} else {
+			msg.History = reactions
+		}
+
 		messages = append(messages, msg)
 		lastTimestamp = timestampStr
 	}
@@ -697,18 +766,128 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 }
 
 // saveMessage saves a chat message to the database
-func (h *Hub) saveMessage(msg Message) error {
+func (h *Hub) saveMessage(msg *Message) error {
 	if h.db == nil {
 		return fmt.Errorf("database not available")
 	}
 
 	query := `INSERT INTO messages(type, username, content, room, timestamp, image_data, image_type) 
-			  VALUES(?, ?, ?, ?, ?, ?, ?)`
+			  VALUES(?, ?, ?, ?, ?, ?, ?) RETURNING id`
 
-	_, err := h.db.Exec(query, string(msg.Type), msg.Username, msg.Content,
-		msg.Room, time.Now().Format(time.RFC3339), msg.ImageData, msg.ImageType)
+	var id int
+	err := h.db.QueryRow(query, string(msg.Type), msg.Username, msg.Content,
+		msg.Room, time.Now().Format(time.RFC3339), msg.ImageData, msg.ImageType).Scan(&id)
 
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to save message: %w", err)
+	}
+
+	// Update the message with its ID
+	msg.ID = id
+	return nil
+}
+
+// saveReaction saves a reaction to the database
+func (h *Hub) saveReaction(msg Message) error {
+	query := `INSERT INTO reactions (message_id, username, reaction) 
+			  VALUES (?, ?, ?)`
+	_, err := h.db.Exec(query, msg.ReactionToID, msg.Username, msg.Reaction)
+	if err != nil {
+		// If it's a unique constraint violation, it means the user already reacted with this emoji
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			// Delete the reaction instead (toggle behavior)
+			query = `DELETE FROM reactions 
+					WHERE message_id = ? AND username = ? AND reaction = ?`
+			_, err = h.db.Exec(query, msg.ReactionToID, msg.Username, msg.Reaction)
+			if err != nil {
+				return fmt.Errorf("failed to remove reaction: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to save reaction: %w", err)
+	}
+	return nil
+}
+
+// getReactions retrieves all reactions for a message
+func (h *Hub) getReactions(messageID int) ([]Message, error) {
+	query := `SELECT username, reaction, timestamp 
+			  FROM reactions 
+			  WHERE message_id = ? 
+			  ORDER BY timestamp ASC`
+
+	rows, err := h.db.Query(query, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query reactions: %w", err)
+	}
+	defer rows.Close()
+
+	var reactions []Message
+	for rows.Next() {
+		var msg Message
+		var timestamp string
+		err := rows.Scan(&msg.Username, &msg.Reaction, &timestamp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan reaction: %w", err)
+		}
+		msg.Type = ReactionMessage
+		msg.ReactionToID = messageID
+		msg.Timestamp = timestamp
+		reactions = append(reactions, msg)
+	}
+
+	return reactions, nil
+}
+
+// handleReactionMessage processes a reaction message
+func (h *Hub) handleReactionMessage(msg Message) error {
+	// First verify that the message exists and get its ID
+	var messageID int
+	err := h.db.QueryRow("SELECT id FROM messages WHERE id = ?", msg.ReactionToID).Scan(&messageID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("message with ID %d not found", msg.ReactionToID)
+		}
+		return fmt.Errorf("failed to verify message: %w", err)
+	}
+
+	// Save the reaction using the verified message ID
+	query := `INSERT INTO reactions (message_id, username, reaction) 
+			  VALUES (?, ?, ?)`
+	_, err = h.db.Exec(query, messageID, msg.Username, msg.Reaction)
+	if err != nil {
+		// If it's a unique constraint violation, it means the user already reacted with this emoji
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			// Delete the reaction instead (toggle behavior)
+			query = `DELETE FROM reactions 
+					WHERE message_id = ? AND username = ? AND reaction = ?`
+			_, err = h.db.Exec(query, messageID, msg.Username, msg.Reaction)
+			if err != nil {
+				return fmt.Errorf("failed to remove reaction: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to save reaction: %w", err)
+		}
+	}
+
+	// Always fetch the updated reactions list
+	reactions, err := h.getReactions(messageID)
+	if err != nil {
+		return fmt.Errorf("failed to get reactions: %w", err)
+	}
+
+	// Create a single message with all reactions
+	reactionUpdate := Message{
+		Type:         ReactionMessage,
+		Room:         msg.Room,
+		ReactionToID: messageID,
+		History:      reactions, // Use History field to send all reactions
+	}
+
+	// Broadcast the single message with all reactions
+	h.broadcastToRoom(reactionUpdate)
+
+	return nil
 }
 
 // readPump handles reading messages from WebSocket connection
@@ -754,6 +933,9 @@ func (c *Client) readPump() {
 				pageSize = DefaultPageSize
 			}
 
+			log.Printf("Loading more history for %s in room %s (pageSize: %d, pageToken: %s)",
+				c.username, c.room, pageSize, msg.PageToken)
+
 			messages, lastTimestamp, err := c.hub.getHistoricalMessages(c.room, pageSize, msg.PageToken)
 			if err != nil {
 				log.Printf("Error getting more history for %s: %v", c.username, err)
@@ -768,6 +950,9 @@ func (c *Client) readPump() {
 				HasMore:   len(messages) == pageSize,
 			}
 
+			log.Printf("Sending %d more historical messages to %s (hasMore: %v, nextPageToken: %s)",
+				len(messages), c.username, historyMsg.HasMore, lastTimestamp)
+
 			select {
 			case c.send <- historyMsg:
 				log.Printf("Sent %d more historical messages to %s", len(messages), c.username)
@@ -779,13 +964,23 @@ func (c *Client) readPump() {
 			// Handle both chat and image messages
 			msg.Timestamp = time.Now().Format(time.RFC3339)
 
-			// Save to database
-			if err := c.hub.saveMessage(msg); err != nil {
+			// Save to database and get the ID
+			if err := c.hub.saveMessage(&msg); err != nil {
 				log.Printf("Error saving message from %s: %v", c.username, err)
+				continue // Skip broadcasting if save failed
 			}
 
-			// Broadcast to room
+			// Broadcast to room with the database ID
 			c.hub.broadcast <- msg
+
+		case ReactionMessage:
+			// Handle reaction messages
+			msg.Timestamp = time.Now().Format(time.RFC3339)
+
+			// Save and broadcast reaction
+			if err := c.hub.handleReactionMessage(msg); err != nil {
+				log.Printf("Error handling reaction from %s: %v", c.username, err)
+			}
 		}
 	}
 }
