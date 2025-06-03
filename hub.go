@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DefaultRoom            = "DEFAULT_ROOM"
+	DefaultRoom            = "БУБИ_РУУМ"
 	WriteWait              = 10 * time.Second
 	PongWait               = 60 * time.Second
 	PingPeriod             = (PongWait * 9) / 10
