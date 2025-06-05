@@ -600,7 +600,11 @@ func (h *Hub) handleClientUnregistration(client *Client) {
 
 // handleBroadcast processes messages to be broadcast
 func (h *Hub) handleBroadcast(message Message) {
-	fmt.Printf("broadcasting message: %v", message)
+	if message.Type == ImageMessage {
+		fmt.Printf("broadcasting image message: %v", message.ImageType)
+	} else {
+		fmt.Printf("broadcasting message: %v", message)
+	}
 	switch message.Type {
 	case ChatMessage, ImageMessage:
 		// The message was already saved in readPump, just broadcast it
