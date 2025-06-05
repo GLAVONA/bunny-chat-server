@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -122,6 +124,21 @@ type SessionResponse struct {
 	Valid    bool   `json:"valid"`
 	Username string `json:"username,omitempty"`
 	Room     string `json:"room,omitempty"`
+}
+
+// GiphyResponse represents the response from GIPHY API
+type GiphyResponse struct {
+	Data []struct {
+		ID     string `json:"id"`
+		Images struct {
+			Original struct {
+				URL string `json:"url"`
+			} `json:"original"`
+			FixedHeight struct {
+				URL string `json:"url"`
+			} `json:"fixed_height"`
+		} `json:"images"`
+	} `json:"data"`
 }
 
 // NewSessionService creates a new session service
@@ -1201,4 +1218,67 @@ func (h *Hub) isUsernameInRoom(username, room string) bool {
 		}
 	}
 	return false
+}
+
+// HandleGiphySearch handles GIPHY API search requests
+func HandleGiphySearch(w http.ResponseWriter, r *http.Request, sessionService *SessionService) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get session cookie
+	cookie, err := r.Cookie(SessionCookieName)
+	if err != nil {
+		log.Printf("No session cookie found: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Validate session
+	_, err = sessionService.GetSession(cookie.Value)
+	if err != nil {
+		log.Printf("Invalid session: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		http.Error(w, "Query parameter 'q' is required", http.StatusBadRequest)
+		return
+	}
+
+	// Get GIPHY API key from environment variable
+	apiKey := os.Getenv("GIPHY_API_KEY")
+	if apiKey == "" {
+		http.Error(w, "GIPHY API key not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Make request to GIPHY API
+	url := fmt.Sprintf("https://api.giphy.com/v1/gifs/search?api_key=%s&q=%s&limit=20", apiKey, url.QueryEscape(query))
+	resp, err := http.Get(url)
+	if err != nil {
+		http.Error(w, "Failed to fetch from GIPHY", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Failed to read GIPHY response", http.StatusInternalServerError)
+		return
+	}
+
+	// Debug log the response
+
+	// Set headers and write response
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
 }

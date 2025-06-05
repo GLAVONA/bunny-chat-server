@@ -155,6 +155,11 @@ func main() {
 		ServeWs(hub, authService, sessionService, w, r)
 	})
 
+	// GIPHY search endpoint
+	r.Get("/giphy/search", func(w http.ResponseWriter, r *http.Request) {
+		HandleGiphySearch(w, r, sessionService)
+	})
+
 	// Health check endpoint
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -165,6 +170,11 @@ func main() {
 	// Print configuration info
 	printStartupInfo()
 
+	// Validate GIPHY API key
+	if os.Getenv("GIPHY_API_KEY") == "" {
+		log.Fatal("GIPHY_API_KEY environment variable is not set")
+	}
+
 	// Get server port from environment or default to 8080
 	port := getEnvOrDefault("PORT", "8080")
 	addr := ":" + port
@@ -174,6 +184,7 @@ func main() {
 	log.Println("Session check endpoint: GET /session")
 	log.Println("Logout endpoint: POST /logout")
 	log.Println("WebSocket endpoint: /ws")
+	log.Println("GIPHY search endpoint: GET /giphy/search")
 	log.Println("Health check endpoint: /health")
 
 	if err := http.ListenAndServe(addr, r); err != nil {
