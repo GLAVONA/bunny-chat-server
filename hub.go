@@ -43,6 +43,7 @@ const (
 	LoadMoreHistory MessageType = "load_more_history"
 	ImageMessage    MessageType = "image"    // New message type for images
 	ReactionMessage MessageType = "reaction" // New message type for reactions
+	ReplyMessage    MessageType = "reply"    // New message type for replies
 )
 
 // Message represents a message in the chat system
@@ -61,6 +62,9 @@ type Message struct {
 	// Reaction fields
 	ReactionToID int    `json:"reactionToId,omitempty"` // ID of the message being reacted to
 	Reaction     string `json:"reaction,omitempty"`     // The reaction emoji/content
+	// Reply fields
+	ReplyToID int      `json:"replyToId,omitempty"` // ID of the message being replied to
+	ReplyTo   *Message `json:"replyTo,omitempty"`   // The message being replied to
 	// Pagination fields
 	PageSize  int    `json:"pageSize,omitempty"`
 	PageToken string `json:"pageToken,omitempty"`
@@ -623,7 +627,18 @@ func (h *Hub) handleBroadcast(message Message) {
 		fmt.Printf("broadcasting message: %v", message)
 	}
 	switch message.Type {
-	case ChatMessage, ImageMessage:
+	case ChatMessage, ImageMessage, ReplyMessage:
+		// For reply messages, fetch the original message if not already present
+
+		if message.ReplyToID > 0 && message.ReplyTo == nil {
+			originalMsg, err := h.getMessageByID(message.ReplyToID)
+
+			if err != nil {
+				log.Printf("Error fetching original message for reply: %v", err)
+			} else {
+				message.ReplyTo = originalMsg
+			}
+		}
 		// The message was already saved in readPump, just broadcast it
 		h.broadcastToRoom(message)
 	case ReactionMessage:
@@ -709,7 +724,7 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 
 	if pageToken == "" {
 		// Initial query
-		query = `SELECT id, type, username, content, timestamp, image_data, image_type 
+		query = `SELECT id, type, username, content, timestamp, image_data, image_type, reply_to_id 
 				FROM messages 
 				WHERE room = ? 
 				ORDER BY timestamp DESC 
@@ -717,7 +732,7 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 		args = []interface{}{room, pageSize + 1} // +1 to check if there are more messages
 	} else {
 		// Pagination query
-		query = `SELECT id, type, username, content, timestamp, image_data, image_type 
+		query = `SELECT id, type, username, content, timestamp, image_data, image_type, reply_to_id 
 				FROM messages 
 				WHERE room = ? AND timestamp < ? 
 				ORDER BY timestamp DESC 
@@ -738,8 +753,9 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 		var msg Message
 		var timestampStr string
 		var imageData, imageType sql.NullString // Use sql.NullString to handle NULL values
+		var replyToID sql.NullInt64             // Use sql.NullInt64 to handle NULL values
 		err := rows.Scan(&msg.ID, &msg.Type, &msg.Username, &msg.Content,
-			&timestampStr, &imageData, &imageType)
+			&timestampStr, &imageData, &imageType, &replyToID)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to scan message: %w", err)
 		}
@@ -753,6 +769,18 @@ func (h *Hub) getHistoricalMessages(room string, pageSize int, pageToken string)
 		}
 		if imageType.Valid {
 			msg.ImageType = imageType.String
+		}
+
+		// Handle reply information
+		if replyToID.Valid {
+			msg.ReplyToID = int(replyToID.Int64)
+			// Fetch the original message
+			originalMsg, err := h.getMessageByID(msg.ReplyToID)
+			if err != nil {
+				log.Printf("Error fetching original message for reply: %v", err)
+			} else {
+				msg.ReplyTo = originalMsg
+			}
 		}
 
 		// Get reactions for this message
@@ -792,12 +820,12 @@ func (h *Hub) saveMessage(msg *Message) error {
 		return fmt.Errorf("database not available")
 	}
 
-	query := `INSERT INTO messages(type, username, content, room, timestamp, image_data, image_type) 
-			  VALUES(?, ?, ?, ?, ?, ?, ?) RETURNING id`
+	query := `INSERT INTO messages(type, username, content, room, timestamp, image_data, image_type, reply_to_id) 
+			  VALUES(?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
 
 	var id int
 	err := h.db.QueryRow(query, string(msg.Type), msg.Username, msg.Content,
-		msg.Room, time.Now().Format(time.RFC3339), msg.ImageData, msg.ImageType).Scan(&id)
+		msg.Room, time.Now().Format(time.RFC3339), msg.ImageData, msg.ImageType, msg.ReplyToID).Scan(&id)
 
 	if err != nil {
 		return fmt.Errorf("failed to save message: %w", err)
@@ -981,9 +1009,19 @@ func (c *Client) readPump() {
 				log.Printf("Failed to send more history to %s: channel full", c.username)
 			}
 
-		case ChatMessage, ImageMessage:
-			// Handle both chat and image messages
+		case ChatMessage, ImageMessage, ReplyMessage:
+			// Handle chat, image, and reply messages
 			msg.Timestamp = time.Now().Format(time.RFC3339)
+
+			// For reply messages, fetch the original message
+			if msg.Type == ReplyMessage && msg.ReplyToID > 0 {
+				originalMsg, err := c.hub.getMessageByID(msg.ReplyToID)
+				if err != nil {
+					log.Printf("Error fetching original message for reply: %v", err)
+					continue
+				}
+				msg.ReplyTo = originalMsg
+			}
 
 			// Save to database and get the ID
 			if err := c.hub.saveMessage(&msg); err != nil {
@@ -1281,4 +1319,50 @@ func HandleGiphySearch(w http.ResponseWriter, r *http.Request, sessionService *S
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
+}
+
+// getMessageByID retrieves a message by its ID
+func (h *Hub) getMessageByID(messageID int) (*Message, error) {
+	if h.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	query := `SELECT id, type, username, content, timestamp, image_data, image_type 
+			  FROM messages 
+			  WHERE id = ?`
+
+	var msg Message
+	var timestampStr string
+	var imageData, imageType sql.NullString
+
+	err := h.db.QueryRow(query, messageID).Scan(
+		&msg.ID, &msg.Type, &msg.Username, &msg.Content,
+		&timestampStr, &imageData, &imageType)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("message with ID %d not found", messageID)
+		}
+		return nil, fmt.Errorf("failed to get message: %w", err)
+	}
+
+	msg.Timestamp = timestampStr
+
+	// Handle NULL values for image data
+	if imageData.Valid {
+		msg.ImageData = imageData.String
+	}
+	if imageType.Valid {
+		msg.ImageType = imageType.String
+	}
+
+	// Get reactions for this message
+	reactions, err := h.getReactions(msg.ID)
+	if err != nil {
+		log.Printf("Error getting reactions for message %d: %v", msg.ID, err)
+	} else {
+		msg.History = reactions
+	}
+
+	return &msg, nil
 }
