@@ -72,6 +72,9 @@ func main() {
 	// Add image columns if they don't exist
 	addImageColumns(db)
 
+	// Add reply_to_id column if it doesn't exist
+	addReplyToIdColumn(db)
+
 	// Create the sessions table
 	createTable(db, "sessions", `(
     id TEXT PRIMARY KEY,
@@ -291,6 +294,29 @@ func addImageColumns(db *sql.DB) {
 			log.Printf("Error adding image columns: %v", err)
 		} else {
 			log.Println("Added image columns to messages table")
+		}
+	}
+}
+
+// addReplyToIdColumn adds the reply_to_id column to the messages table if it doesn't exist
+func addReplyToIdColumn(db *sql.DB) {
+	// Check if reply_to_id column exists
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='reply_to_id'").Scan(&count)
+	if err != nil {
+		log.Printf("Error checking for reply_to_id column: %v", err)
+		return
+	}
+
+	// Add column if it doesn't exist
+	if count == 0 {
+		alterSQL := `ALTER TABLE messages ADD COLUMN reply_to_id INTEGER REFERENCES messages(id);
+                    CREATE INDEX IF NOT EXISTS idx_messages_reply_to_id ON messages(reply_to_id);`
+		_, err := db.Exec(alterSQL)
+		if err != nil {
+			log.Printf("Error adding reply_to_id column: %v", err)
+		} else {
+			log.Println("Added reply_to_id column to messages table")
 		}
 	}
 }
